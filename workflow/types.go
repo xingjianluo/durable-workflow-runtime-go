@@ -65,6 +65,7 @@ const (
 	EvLeaseTakenOver    EventType = "lease_taken_over"
 	EvLeaseRenewed      EventType = "lease_renewed"
 	EvLeaseReleased     EventType = "lease_released"
+	EvWorkflowResumed   EventType = "workflow_resumed"
 )
 
 // Event 是一次持久化的状态变化记录（追加写）。
@@ -93,6 +94,9 @@ type StepState struct {
 	Failures      []Failure    `json:"failures,omitempty"`
 	FinalClass    FailureClass `json:"final_class,omitempty"`
 	FinalReason   string       `json:"final_reason,omitempty"`
+	// ExtraAttempts 是续跑（Resume）为该步骤追加的尝试预算总额；
+	// 有效预算 = RetryPolicy.MaxAttempts + ExtraAttempts。旧数据缺省为 0，语义不变。
+	ExtraAttempts int `json:"extra_attempts,omitempty"`
 }
 
 // Lease 是工作流实例的执行租约。
@@ -102,6 +106,15 @@ type Lease struct {
 	AcquiredAt time.Time `json:"acquired_at"`
 	ExpiresAt  time.Time `json:"expires_at"`
 	Fence      int64     `json:"fence"` // 单调递增的 fencing 令牌
+}
+
+// ResumeRecord 是一次续跑的持久化记录：第几次续跑、给哪一步追加了多少预算。
+type ResumeRecord struct {
+	Seq           int       `json:"seq"`            // 第几次续跑（从 1 开始）
+	StepIndex     int       `json:"step_index"`     // 被续跑的步骤下标
+	AddedAttempts int       `json:"added_attempts"` // 本次追加的尝试预算
+	At            time.Time `json:"at"`
+	By            string    `json:"by,omitempty"` // 发起续跑的执行者
 }
 
 // WorkflowState 是工作流实例的完整可恢复快照。
@@ -118,6 +131,8 @@ type WorkflowState struct {
 	Result    string         `json:"result,omitempty"` // 末步结果即工作流结果
 	Failure   *Failure       `json:"failure,omitempty"`
 	Input     string         `json:"input,omitempty"`
+	// Resumes 追加保存每次续跑记录；实例身份不变、历史不丢。
+	Resumes []ResumeRecord `json:"resumes,omitempty"`
 }
 
 // RetryPolicy 描述步骤的重试、超时与终止策略。

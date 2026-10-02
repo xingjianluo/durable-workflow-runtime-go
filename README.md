@@ -24,17 +24,19 @@
               ┌─────────┐   所有步骤成功    ┌────────────┐
               │ running │ ───────────────▶ │ completed  │（终态）
               └─────────┘                   └────────────┘
-                   │  永久错误 / 重试预算耗尽 / Terminate
-                   ▼
-              ┌─────────┐
-              │ failed  │（终态）
-              └─────────┘
+                 ▲  │  永久错误 / 重试预算耗尽 / Terminate
+                 │  ▼
+   Resume(+n) │ ┌─────────┐
+              └─│ failed  │（终态，可显式续跑）
+                └─────────┘
 ```
 
 - `running`：至少还有步骤未结束（步骤可能在等待退避）。
-- `completed`：全部步骤成功；`Result` 为末步结果。
+- `completed`：全部步骤成功；`Result` 为末步结果。不可续跑。
 - `failed`：某步骤永久失败或重试预算耗尽；`Failure` 记录最终分类与原因。
-- 终态不可逆：重复 `Tick`、重复 `Advance`、重复 `Terminate` 都不会复活或重复提交。
+  **可由调用方显式 `Resume` 续跑**（见第 3.4 节），续跑后回到 `running`。
+- 终态不可逆（除 `Resume` 这条显式通道）：重复 `Tick`、重复 `Advance`、
+  重复 `Terminate` 都不会复活或重复提交。
 
 非法迁移（如对终态实例获取租约、退避未到期推进、无租约推进）返回 `*ConflictError`，
 用其 `Kind` 字段（`errors.As`）区分原因：
@@ -52,6 +54,9 @@
 | `lease_expired` | 租约已过期，需重新领取/接管 |
 | `lease_version_stale` | token/fence 不匹配（租约已被接管） |
 | `version_conflict` | 乐观版本不匹配（并发提交落败） |
+| `workflow_already_completed` | 续跑已成功完成的实例 |
+| `workflow_not_failed` | 续跑未失败的实例（如仍在运行） |
+| `invalid_extra_attempts` | 续跑未给出正的追加尝试次数 |
 
 ### 1.2 步骤状态 `StepStatus`
 
@@ -146,6 +151,49 @@ IdempotencyToken = "<workflowID>#step<index>"
 `Engine.Terminate(id, reason)` 以永久失败终止实例：当前步骤记 `failed`、
 工作流记 `failed`，并记录原因；重复终止幂等（不产生新提交）。他人持有活跃租约时拒绝终止。
 
+### 3.4 失败后续跑（Resume）
+
+`Engine.Resume(id, extraAttempts)` 让已失败的实例**从卡住的步骤接着跑**：
+
+- **适用条件**：仅 `failed` 实例（重试预算耗尽、超时按瞬时耗尽、人工 `Terminate`）。
+  `completed` 实例拒绝（`workflow_already_completed`），`running` 实例拒绝
+  （`workflow_not_failed`），两种原因可区分。
+- **追加预算语义**：`extraAttempts` 必须由调用方显式给出且为正数，
+  否则拒绝（`invalid_extra_attempts`）——不默认放开。追加的预算累计到卡住步骤的
+  `StepState.ExtraAttempts`，有效预算 = `RetryPolicy.MaxAttempts + ExtraAttempts`。
+- **身份与历史不变**：不新建实例、ID 不变、游标不动、尝试编号从既有 `Attempt`
+  继续递增；已成功步骤绝不重跑；事件、失败记录全部保留，并追加一条
+  `workflow_resumed` 事件与 `WorkflowState.Resumes` 记录（第几次续跑、给哪一步、
+  追加多少、何时、由谁发起）。
+- **并发安全**：并发续跑只有一个能提交（乐观版本），其余收到 `version_conflict`；
+  串行的重复续跑因实例已不在 `failed` 而被拒绝。续跑只把实例置回 `running`，
+  之后的推进仍走租约 + fencing 互斥，同一步骤任意时刻只有一个执行者。
+
+### 3.5 崩溃中断尝试的记账规则
+
+尝试在 `step_started` 落盘时即视为**已用掉一次预算**（`Attempt` 已递增并持久化）。
+若进程在活动执行期间崩溃，留下 `running + Attempt=n` 的在途尝试：
+
+- 接管者（租约过期后）或续跑方看到 `Attempt=n` 时，n 已计入消耗，
+  下一次尝试编号为 n+1，**不会漏记也不会重记**；
+- 若 n 已等于有效预算，接管/推进时**不再发起新的活动调用**，直接把该在途尝试
+  补记为 `interrupted` 失败并落账「预算耗尽」（原因中含
+  `last attempt interrupted before completion`）——不会凭空多送一次活动调用；
+- 被中断的尝试可由 `Resume` 追加预算后继续，编号从 n+1 开始。
+
+### 3.6 审计轨迹（Audit）
+
+`Engine.Audit(id)` 从**持久化的事件与快照**重建完整复盘报告（不依赖进程内存，
+重启后查询结果逐字段一致）：
+
+- `Attempts`：每一次尝试的步骤、编号、开始/结束时间与时长、去向分类
+  （`succeeded` / `failed` / `interrupted` / `in_progress`）、失败分类、
+  租约标识，以及**该次尝试开始时按当时预算计算的剩余可用次数**；
+- `Resumes`：实例被续跑过几次、每次给哪一步追加了多少预算、何时由谁发起。
+
+把 `Attempts` 与 `Resumes` 串起来即可解释「当时为什么继续、为什么终止」：
+预算随续跑事件追加、随 `step_started` 消耗，最终状态与轨迹末条记录一致。
+
 ---
 
 ## 4. 并发约束（多执行者 / 接管）
@@ -176,7 +224,7 @@ IdempotencyToken = "<workflowID>#step<index>"
 go build ./...
 go vet ./...
 
-# 全部单测（含重启恢复、重复调度、超时、永久失败、并发接管等）
+# 全部单测（含重启恢复、重复调度、超时、永久失败、并发接管、失败续跑、审计轨迹等）
 go test ./... -v
 
 # 竞态检测 + 重复运行（并发用例建议多跑）
@@ -203,6 +251,16 @@ go test ./... -race -count=20
 | `TestTerminate` / `TestUnknownActivityIsPermanent` | 终止幂等、未注册活动即永久失败 |
 | `TestLeaseRenewalAndAdvanceWithWrongLease` | 续租延长有效期、错误 fence 被拒 |
 | `TestTickAdvancesMultipleInstances` | 多实例同批推进 |
+| `TestResumeContinuesFromStuckStep` | 续跑从卡住步骤继续、尝试编号连续、已成功步骤不重跑、历史不丢 |
+| `TestResumeRequiresExplicitBudget` | 续跑必须显式给出正的追加预算，否则拒绝 |
+| `TestResumeCompletedAndRunningRejected` | 成功/运行中实例拒绝续跑且原因可区分 |
+| `TestConcurrentResumeOnlyOneWins` | 并发续跑同一实例恰好一个成功 |
+| `TestResumeThenConcurrentTicksSingleAdvancer` | 续跑后并发调度只有一个执行者推进同一步骤 |
+| `TestCrashInterruptedAttemptBudgetAccounting` | 崩溃在途尝试计入预算、接管不突破上限、续跑后续编号继续 |
+| `TestResumeTerminatedInstance` | 人工终止的实例可续跑且终止历史保留 |
+| `TestAuditTrailMatchesFinalState` | 审计轨迹与最终状态一致、重启后重建结果稳定 |
+| `TestAuditMarksInterruptedAttempt` | 崩溃中断的尝试被标记 interrupted 且计入预算 |
+| `TestAuditInProgressAttempt` | 在途尝试标记为 in_progress |
 
 测试日志会打印工作流标识、步骤下标、状态变化、尝试序号、租约/fence 与失败分类，例如：
 
@@ -240,6 +298,20 @@ for { // 或用 eng.Run(ctx, interval)
     time.Sleep(100 * time.Millisecond)
 }
 ```
+
+## 兼容性（老实例与已有数据）
+
+- **旧数据可直接打开**：`StepState.ExtraAttempts`、`WorkflowState.Resumes`、
+  `workflow_resumed` 事件均为新增可选字段，旧实例文件缺省为零值，语义与升级前完全一致
+  （有效预算 = 定义中的 `MaxAttempts`）。
+- **旧失败实例可续跑**：升级前进入 `failed` 的实例同样可 `Resume`，
+  尝试编号从既有 `Attempt` 继续。
+- **审计对旧事件降级可用**：旧 `step_started` 事件缺少 `max_attempts` 明细时，
+  剩余预算按「定义基准 + 历次续跑追加」的时间线推算；定义未注册时该字段为 -1（未知），
+  其余轨迹信息不受影响。
+- **行为变化点**：尝试开始前新增预算入账检查——崩溃留下的在途尝试若已耗尽预算，
+  接管时不再多跑一次活动，而是落账「预算耗尽（interrupted）」。这只影响
+  「崩溃恰好发生在最后一次预算尝试执行中」的实例，使其不再凭空多获一次活动调用。
 
 ## 设计边界与扩展点
 
