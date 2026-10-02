@@ -7,6 +7,10 @@
 - 冲突与非法状态迁移一律被**拒绝并返回可区分原因**，不静默覆盖；
 - 活动失败按「瞬时 / 超时 / 永久」分类：瞬时可重试、永久立即终止、重试预算耗尽即失败；
 - 失败历史、最终分类、重试依据全部持久化、可查询、同输入结论可复现；
+- 已失败的实例可由调用方**显式续跑**（`Resume`）：追加明确的尝试预算后从卡住的步骤继续，
+  已成功步骤不重跑、实例身份与历史不变；
+- 每一轮尝试的完整轨迹（起止、分类、是否被崩溃/接管中断、当时剩余预算）与每次续跑记录
+  可通过 `Audit` 从持久化数据稳定重建；
 - 多执行者并发推进时，靠「租约 + fencing 令牌 + 乐观版本」保证步骤不并发执行、状态不回退、结果不丢失。
 
 包路径：`github.com/xingjianluo/durable-workflow-runtime-go/workflow`
@@ -22,19 +26,22 @@
                    │
                    ▼
               ┌─────────┐   所有步骤成功    ┌────────────┐
-              │ running │ ───────────────▶ │ completed  │（终态）
+              │ running │ ───────────────▶ │ completed  │（终态，不可逆）
               └─────────┘                   └────────────┘
-                   │  永久错误 / 重试预算耗尽 / Terminate
-                   ▼
-              ┌─────────┐
-              │ failed  │（终态）
-              └─────────┘
+                 │  ▲  永久错误 / 重试预算耗尽 / Terminate
+                 │  └──────────────────────┐
+                 ▼                         │
+              ┌─────────┐   Resume(extra)  │
+              │ failed  │ ─────────────────┘
+              └─────────┘（失败态：可显式续跑）
 ```
 
 - `running`：至少还有步骤未结束（步骤可能在等待退避）。
-- `completed`：全部步骤成功；`Result` 为末步结果。
+- `completed`：全部步骤成功；`Result` 为末步结果。不可续跑、不可逆。
 - `failed`：某步骤永久失败或重试预算耗尽；`Failure` 记录最终分类与原因。
-- 终态不可逆：重复 `Tick`、重复 `Advance`、重复 `Terminate` 都不会复活或重复提交。
+  失败态不再自动推进，但可由调用方 `Resume` 显式追加预算后回到 `running`（见第 3.4 节）。
+- 除「failed →（显式 Resume）→ running」外终态不可逆：重复 `Tick`、重复 `Advance`、
+  重复 `Terminate` 都不会复活或重复提交。
 
 非法迁移（如对终态实例获取租约、退避未到期推进、无租约推进）返回 `*ConflictError`，
 用其 `Kind` 字段（`errors.As`）区分原因：
@@ -47,6 +54,9 @@
 | `step_already_completed` | 已完成步骤被要求重跑（由游标保护，直接跳过） |
 | `no_runnable_step` | 步骤处于退避等待（`NextAttemptAt` 未到） |
 | `workflow_terminal` | 对终态实例获取租约/推进 |
+| `resume_completed_workflow` | 对已成功完成的实例调用 `Resume` |
+| `resume_not_failed` | 对非 failed 状态（如 running）的实例调用 `Resume` |
+| `resume_invalid_budget` | `Resume` 未显式给出有效的追加尝试次数（<=0） |
 | `lease_not_held` | 未持有租约却推进 |
 | `lease_held_by_another_worker` | 他人有效租约未过期 |
 | `lease_expired` | 租约已过期，需重新领取/接管 |
@@ -96,13 +106,26 @@
 
 1. 若崩溃发生在**步骤成功提交之后**：游标已前移，恢复后从下一步继续，上一步绝不重跑。
 2. 若崩溃发生在**活动执行期间**：磁盘上是 `running + Attempt=n + 旧租约`。
-   新执行者必须等旧租约过期后才能接管（产生 `lease_taken_over`，fence 递增），
-   随后以**同一个幂等令牌**重新执行该步骤（`Attempt` 变为 n+1）。
+   新执行者必须等旧租约过期后才能接管（产生 `lease_taken_over`，fence 递增）。
+   **在途尝试的记账规则**：`step_started` 落盘即视为一次已消耗的尝试——接管者
+   先补记一条 `Interrupted` 失败记录（事件 `step_attempt_interrupted`），再按预算判定：
+   - 预算仍有剩余：步骤回到待调度，以**同一个幂等令牌**开始第 n+1 次尝试；
+   - 预算已耗尽（n ≥ 有效预算）：**不再发起任何新的活动调用**，直接以
+     「重试预算耗尽」提交终局失败。既不会凭空多送一次活动调用，也不会漏记已消耗的尝试。
+
    被遗弃的旧协程晚到的结果会因 fence/版本不匹配而被**丢弃**，不会覆盖新状态。
 3. 若崩溃发生在**退避等待期间**：`NextAttemptAt` 已持久化，恢复后在到期前
    不会提前重试，到期后正常重试。
 
-### 2.3 幂等令牌（业务副作用恰好一次）
+### 2.3 与老实例数据的兼容
+
+续跑/审计引入的字段（`StepState.ExtraAttempts`、`WorkflowState.Resumes`、
+`Failure.Interrupted`）全部 `omitempty`：老版本写出的状态文件读进来后这些字段为零值，
+行为与之前完全一致（有效预算 = 原 `MaxAttempts`，无续跑记录）；老实例可以直接
+`Resume`，追加预算从 0 开始累计。事件日志是纯追加的，新事件类型
+（`step_attempt_interrupted`、`workflow_resumed`）只在新路径上产生，不影响旧事件的解释。
+
+### 2.4 幂等令牌（业务副作用恰好一次）
 
 同一逻辑步骤的所有尝试共享稳定令牌：
 
@@ -145,6 +168,41 @@ IdempotencyToken = "<workflowID>#step<index>"
 
 `Engine.Terminate(id, reason)` 以永久失败终止实例：当前步骤记 `failed`、
 工作流记 `failed`，并记录原因；重复终止幂等（不产生新提交）。他人持有活跃租约时拒绝终止。
+终止本身**不消耗尝试预算**（`Attempt` 不变），因此终止后仍可续跑。
+
+### 3.4 失败后显式续跑（`Resume`）
+
+`Engine.Resume(id, extraAttempts)` 让一个 `failed` 实例从卡住的步骤接着跑：
+
+- **适用条件**：仅当实例处于 `failed`（重试预算耗尽、超时/永久失败、人工 `Terminate`）。
+  已成功完成的实例返回 `resume_completed_workflow`，仍在运行的实例返回
+  `resume_not_failed`，均为可区分的拒绝原因。
+- **追加预算语义**：`extraAttempts` 是本次愿意追加的尝试次数，**必须显式给出且 ≥ 1**；
+  不指定（0）或负数一律拒绝（`resume_invalid_budget`），绝不默认放开。
+  步骤的有效预算 = `RetryPolicy.MaxAttempts` + 历次追加累计（`StepState.ExtraAttempts`），
+  已消耗的尝试编号继续累进，不重置。
+- **身份与历史不变**：续跑不是新建实例——ID、游标、已成功步骤的结果、失败历史、
+  事件日志全部保留；每次续跑追加一条 `ResumeRecord`（第几次、何时、谁发起、
+  追加多少预算）与 `workflow_resumed` 事件。
+- **与正常跑一致**：续跑后的实例与一路正常跑的同类实例遵循同一套判定——
+  相同的失败分类、相同的预算检查、相同的终局结论；已成功步骤绝不重跑，
+  业务副作用靠稳定幂等令牌保证不重复。
+- 续跑只是把工作流置回 `running` 并追加预算，实际推进仍走租约 + fencing + 乐观版本，
+  因此续跑与接管并发时同一步骤任一时刻只有一个执行者在推进。
+
+### 3.5 审计轨迹（`Audit`）
+
+`Engine.Audit(id)` 从持久化的事件历史与快照重建一个实例的完整轨迹，不依赖进程内存，
+重启后查询结果稳定一致：
+
+- 每一轮尝试一条 `AttemptRecord`：尝试编号、开始/结束时间与时长、结局分类
+  （`succeeded` / `failed` / `interrupted` / `in_flight`）、失败分类与原因、
+  执行租约，以及**该尝试结束后按当时有效预算计算的剩余可用尝试次数**；
+- 每一次续跑一条 `ResumeRecord`：第几次续跑、追加了多少预算、卡在哪个步骤；
+- 每个步骤当前的有效预算 `EffectiveMaxAttempts`。
+
+这些信息串起来即可解释「当时为什么继续、为什么终止」：例如某次尝试是活动返回失败、
+还是被崩溃/接管中断；预算耗尽终止时已经消耗了几次；续跑后又追加了多少。
 
 ---
 
@@ -203,6 +261,14 @@ go test ./... -race -count=20
 | `TestTerminate` / `TestUnknownActivityIsPermanent` | 终止幂等、未注册活动即永久失败 |
 | `TestLeaseRenewalAndAdvanceWithWrongLease` | 续租延长有效期、错误 fence 被拒 |
 | `TestTickAdvancesMultipleInstances` | 多实例同批推进 |
+| `TestResumeContinuesFromFailedStep` | 续跑从卡住的步骤继续、尝试编号累进、已成功步骤不重跑、历史保留 |
+| `TestResumeRequiresExplicitBudget` | 不指定/无效追加预算一律拒绝且状态不变 |
+| `TestResumeCompletedAndRunningRejected` | 成功实例/运行中实例续跑被可区分原因拒绝 |
+| `TestResumeAfterTerminate` | 人工终止后续跑，终止不消耗预算 |
+| `TestResumeMatchesStraightRunConclusion` | 续跑实例与一路正常跑实例的最终状态/尝试数/失败记录一致 |
+| `TestResumeConcurrentTakeoverSingleAdvancer` | 续跑后两执行者并发推进，恰好一方成功、副作用一次 |
+| `TestInterruptedAttemptAccountingAtBudgetLimit` | 崩溃在途尝试计为已消耗，预算耗尽不再发起活动调用，续跑后继续 |
+| `TestAuditTrailMatchesFinalState` | 审计轨迹覆盖每轮尝试与续跑，重启后重建一致、与最终状态对得上 |
 
 测试日志会打印工作流标识、步骤下标、状态变化、尝试序号、租约/fence 与失败分类，例如：
 
@@ -210,6 +276,8 @@ go test ./... -race -count=20
 level=info workflow=wf-1 step=0 msg="step started" status=running attempt=1 activity=charge lease=lease-… fence=1
 level=warn workflow=wf-r step=0 msg="step failed" status=waiting attempt=1 class=transient will_retry=true backoff=50ms
 level=error workflow=wf-p step=0 msg="step failed" status=failed attempt=1 class=permanent will_retry=false
+level=error workflow=wf-c step=0 msg="attempt interrupted" status=failed attempt=2 class=transient will_retry=false max_attempts=2
+level=info workflow=wf-c step=0 msg="workflow resumed" status=running resume_seq=1 extra_attempts=1 attempts_used=2
 ```
 
 ### 端到端示例

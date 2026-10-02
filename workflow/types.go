@@ -47,6 +47,9 @@ type Failure struct {
 	At          time.Time    `json:"at"`
 	DuringLease string       `json:"lease_id,omitempty"`
 	TimedOut    bool         `json:"timed_out,omitempty"`
+	// Interrupted 为 true 表示该尝试并非活动返回失败，而是进程崩溃/租约被接管
+	// 导致在途尝试中断；它同样计为一次已消耗的尝试。
+	Interrupted bool `json:"interrupted,omitempty"`
 }
 
 // EventType 是事件日志中记录的状态变化种类。
@@ -62,9 +65,13 @@ const (
 	EvWorkflowCompleted EventType = "workflow_completed"
 	EvWorkflowFailed    EventType = "workflow_failed"
 	EvLeaseAcquired     EventType = "lease_acquired"
-	EvLeaseTakenOver    EventType = "lease_taken_over"
 	EvLeaseRenewed      EventType = "lease_renewed"
 	EvLeaseReleased     EventType = "lease_released"
+	EvLeaseTakenOver    EventType = "lease_taken_over"
+	// EvStepAttemptInterrupted 记录一次在途尝试因崩溃/接管被中断的记账事件。
+	EvStepAttemptInterrupted EventType = "step_attempt_interrupted"
+	// EvWorkflowResumed 记录一次显式续跑（追加预算、失败态回到 running）。
+	EvWorkflowResumed EventType = "workflow_resumed"
 )
 
 // Event 是一次持久化的状态变化记录（追加写）。
@@ -93,6 +100,18 @@ type StepState struct {
 	Failures      []Failure    `json:"failures,omitempty"`
 	FinalClass    FailureClass `json:"final_class,omitempty"`
 	FinalReason   string       `json:"final_reason,omitempty"`
+	// ExtraAttempts 是续跑为该步骤追加的尝试预算累计值；
+	// 有效预算 = RetryPolicy.MaxAttempts + ExtraAttempts。
+	ExtraAttempts int `json:"extra_attempts,omitempty"`
+}
+
+// ResumeRecord 记录一次显式续跑：何时、由哪个执行者、追加了多少尝试预算。
+type ResumeRecord struct {
+	Seq           int       `json:"seq"` // 第几次续跑（从 1 开始）
+	At            time.Time `json:"at"`
+	By            string    `json:"by"`             // 发起续跑的执行者
+	ExtraAttempts int       `json:"extra_attempts"` // 本次追加的尝试预算
+	StepIndex     int       `json:"step_index"`     // 续跑时卡住的步骤下标
 }
 
 // Lease 是工作流实例的执行租约。
@@ -118,6 +137,8 @@ type WorkflowState struct {
 	Result    string         `json:"result,omitempty"` // 末步结果即工作流结果
 	Failure   *Failure       `json:"failure,omitempty"`
 	Input     string         `json:"input,omitempty"`
+	// Resumes 是该实例被显式续跑的完整记录（追加写，永不删除）。
+	Resumes []ResumeRecord `json:"resumes,omitempty"`
 }
 
 // RetryPolicy 描述步骤的重试、超时与终止策略。

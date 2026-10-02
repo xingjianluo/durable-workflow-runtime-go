@@ -15,6 +15,8 @@ var (
 	ErrUnknownActivity      = errors.New("workflow: unknown activity")
 	ErrWorkflowCompleted    = errors.New("workflow: workflow already terminal")
 	ErrNoRunnableStep       = errors.New("workflow: no runnable step now")
+	ErrWorkflowNotFailed    = errors.New("workflow: workflow is not in failed state")
+	ErrResumeInvalidBudget  = errors.New("workflow: resume requires a positive extra attempts budget")
 )
 
 // ConflictKind 标识冲突/非法状态迁移的具体原因。
@@ -32,6 +34,12 @@ const (
 	ConflictNoRunnable         ConflictKind = "no_runnable_step"
 	ConflictNotTerminal        ConflictKind = "not_terminal"
 	ConflictStartAlreadyExists ConflictKind = "workflow_already_exists"
+	// ConflictResumeCompleted 续跑一个已成功完成的实例（可区分于其他终态拒绝）。
+	ConflictResumeCompleted ConflictKind = "resume_completed_workflow"
+	// ConflictResumeNotFailed 续跑一个并非 failed 状态的实例（如仍在 running）。
+	ConflictResumeNotFailed ConflictKind = "resume_not_failed"
+	// ConflictResumeInvalidBudget 续跑未显式给出有效的追加尝试次数（<=0）。
+	ConflictResumeInvalidBudget ConflictKind = "resume_invalid_budget"
 )
 
 // ConflictError 包装一个可区分原因的冲突。

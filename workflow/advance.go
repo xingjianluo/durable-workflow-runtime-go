@@ -34,6 +34,20 @@ func (e *Engine) Advance(ctx context.Context, id string, token string, fence int
 		return st, conflictMsg(ConflictNoRunnable, "step waiting for backoff until "+step.NextAttemptAt.Format(time.RFC3339Nano))
 	}
 
+	// 崩溃/接管遗留的在途尝试：step_started 已落盘即视为一次已消耗的尝试。
+	// 先补记账（中断记录 + 预算判定），再决定是继续新尝试还是直接终局失败。
+	if step.Status == StepRunning {
+		st, err = e.accountInterrupted(ctx, st, sd, token)
+		if err != nil {
+			return nil, err
+		}
+		if st.Status.Terminal() {
+			// 在途尝试已耗尽预算：accountInterrupted 已提交终局失败，不再发起活动调用。
+			return st, nil
+		}
+		step = st.Steps[st.Cursor]
+	}
+
 	// 标记尝试开始并先落盘：即使随后进程崩溃，接管者也能看到“进行中”的尝试编号，
 	// 且由于幂等令牌只依赖 (workflow, step)，接管重试不会产生新的业务副作用身份。
 	attempt := step.Attempt + 1
@@ -91,6 +105,72 @@ func (e *Engine) Advance(ctx context.Context, id string, token string, fence int
 
 func unknownDefErr(name string) error {
 	return &ConflictError{Kind: ConflictInvalidTransition, Msg: "unknown definition: " + name, Err: ErrInvalidState}
+}
+
+// accountInterrupted 给崩溃/接管遗留的在途尝试补记账。该尝试的 step_started 已落盘，
+// 因此计为一次已消耗的尝试（追加一条 Interrupted 失败记录，可查询、可审计）：
+//   - 预算仍有剩余：步骤回到 pending，调用方可在同一轮 Advance 里开始新尝试；
+//   - 预算已耗尽：不再发起任何新活动调用，直接以“预算耗尽”提交终局失败。
+//
+// 无论哪条路都不会凭空多送一次活动调用，也不会漏记已消耗的尝试。
+func (e *Engine) accountInterrupted(ctx context.Context, st *WorkflowState, sd StepDef, token string) (*WorkflowState, error) {
+	id := st.ID
+	cursor := st.Cursor
+	step := st.Steps[cursor]
+	now := e.clock.Now()
+
+	f := Failure{Attempt: step.Attempt, Class: FailureTransient,
+		Message: "attempt interrupted: executor crashed or lease was taken over",
+		At:      now, Interrupted: true}
+	step.Failures = append(step.Failures, f)
+	maxAttempts := sd.Retry.MaxAttemptsVal() + step.ExtraAttempts
+	events := []Event{{WorkflowID: id, StepIndex: cursor, Type: EvStepAttemptInterrupted, At: now,
+		Attempt: step.Attempt, LeaseID: token,
+		Detail: map[string]any{"step": step.Name, "attempt": step.Attempt,
+			"attempts_used": step.Attempt, "max_attempts": maxAttempts, "message": f.Message}}}
+
+	if step.Attempt < maxAttempts {
+		step.Status = StepPending
+		step.NextAttemptAt = nil
+		st.UpdatedAt = now
+		committed, err := e.store.Commit(ctx, id, st.Version, st, events)
+		if err != nil {
+			return nil, err
+		}
+		e.log.Logf("warn", id, cursor, "attempt interrupted", "status", StepPending,
+			"attempt", step.Attempt, "attempts_used", step.Attempt, "max_attempts", maxAttempts,
+			"budget_remaining", maxAttempts-step.Attempt)
+		return committed, nil
+	}
+
+	// 在途尝试已用完预算：终局失败，原因可解释。
+	reason := "retry budget exhausted after " + itoa(step.Attempt) + " attempt(s): last attempt interrupted (crash/takeover)"
+	step.Status = StepFailed
+	step.EndedAt = &now
+	step.FinalClass = FailureTransient
+	step.FinalReason = reason
+	st.Status = WFFailed
+	finalFailure := Failure{Attempt: step.Attempt, Class: FailureTransient, Message: reason, At: now, Interrupted: true}
+	st.Failure = &finalFailure
+	st.Lease = nil
+	st.UpdatedAt = now
+	events = append(events,
+		Event{WorkflowID: id, StepIndex: cursor, Type: EvStepFailed, At: now, Attempt: step.Attempt, LeaseID: token,
+			Detail: map[string]any{"step": step.Name, "class": FailureTransient, "attempt": step.Attempt,
+				"max_attempts": maxAttempts, "interrupted": true, "will_retry": false, "message": reason}},
+		Event{WorkflowID: id, Type: EvWorkflowFailed, At: now, LeaseID: token,
+			Detail: map[string]any{"class": FailureTransient, "reason": reason, "attempts": step.Attempt}},
+		Event{WorkflowID: id, Type: EvLeaseReleased, At: now, LeaseID: token,
+			Detail: map[string]any{"holder": e.workerID, "reason": "workflow_failed"}})
+	committed, err := e.store.Commit(ctx, id, st.Version, st, events)
+	if err != nil {
+		return nil, err
+	}
+	e.log.Logf("error", id, cursor, "attempt interrupted", "status", StepFailed, "attempt", step.Attempt,
+		"class", FailureTransient, "will_retry", false, "max_attempts", maxAttempts, "reason", reason)
+	e.log.Logf("error", id, -1, "workflow failed", "status", WFFailed, "class", FailureTransient, "attempts", step.Attempt)
+	e.log.Logf("info", id, -1, "lease released", "holder", e.workerID, "reason", "workflow_failed")
+	return committed, nil
 }
 
 // runActivity 执行一次活动尝试，AttemptTimeout>0 时用 Clock 驱动超时取消。
@@ -196,7 +276,7 @@ func (e *Engine) commitFailed(ctx context.Context, st *WorkflowState, sd StepDef
 	step.Failures = append(step.Failures, f)
 	endAt := now
 
-	maxAttempts := sd.Retry.MaxAttemptsVal()
+	maxAttempts := sd.Retry.MaxAttemptsVal() + step.ExtraAttempts
 	canRetry := class != FailurePermanent && attempt < maxAttempts
 
 	events := []Event{{WorkflowID: id, StepIndex: cursor, Type: EvStepFailed, At: now, Attempt: attempt, LeaseID: token,
