@@ -177,22 +177,51 @@ IdempotencyToken = "<workflowID>#step<index>"
 - 接管者（租约过期后）或续跑方看到 `Attempt=n` 时，n 已计入消耗，
   下一次尝试编号为 n+1，**不会漏记也不会重记**；
 - 若 n 已等于有效预算，接管/推进时**不再发起新的活动调用**，直接把该在途尝试
-  补记为 `interrupted` 失败并落账「预算耗尽」（原因中含
-  `last attempt interrupted before completion`）——不会凭空多送一次活动调用；
+  补记为 `interrupted` 失败并落账「预算耗尽」（`step_failed` 事件带
+  `interrupted=true`，原因中含 `last attempt interrupted before completion`）
+  ——不会凭空多送一次活动调用；
 - 被中断的尝试可由 `Resume` 追加预算后继续，编号从 n+1 开始。
 
 ### 3.6 审计轨迹（Audit）
 
 `Engine.Audit(id)` 从**持久化的事件与快照**重建完整复盘报告（不依赖进程内存，
-重启后查询结果逐字段一致）：
+重启后查询结果逐字段一致；实例已到终态后回头查同样稳定）：
 
 - `Attempts`：每一次尝试的步骤、编号、开始/结束时间与时长、去向分类
   （`succeeded` / `failed` / `interrupted` / `in_progress`）、失败分类、
   租约标识，以及**该次尝试开始时按当时预算计算的剩余可用次数**；
 - `Resumes`：实例被续跑过几次、每次给哪一步追加了多少预算、何时由谁发起。
 
-把 `Attempts` 与 `Resumes` 串起来即可解释「当时为什么继续、为什么终止」：
-预算随续跑事件追加、随 `step_started` 消耗，最终状态与轨迹末条记录一致。
+**「被中断」（`interrupted`）的判定口径**——执行被打断、根本没跑出业务结果，
+与业务真实返回错误的 `failed` 必须能分开看。满足下列任一落盘形态即判为被中断：
+
+1. 该次尝试的 `step_failed` 事件带 `interrupted=true`：接管/推进时发现这次在途
+   尝试已把最后一次预算用掉，于是补记落账「预算耗尽」，期间**没有**发起新的活动
+   调用（见 3.5）。这种情况下复盘结论是 `interrupted` 而不是普通 `failed`，
+   `Class` 留空（没有可归因的业务错误分类）；
+2. 只有 `step_started`、没有任何闭环事件（既无 `step_succeeded` 也无
+   `step_failed`），且它又不是当前正在执行的那次尝试：崩溃/接管后被遗弃的历史
+   尝试。这类记录没有结束时间——它确实从未结束。
+
+`failed` 只用于：有未带 `interrupted` 标记的 `step_failed` 闭环，即活动确实执行
+完并返回了错误（瞬时/超时/永久）。
+
+**「进行中」（`in_progress`）的判定口径**——同一步骤同一时刻**至多一条**。必须
+同时满足：该步骤是快照当前游标步骤、步骤状态为 `running`、快照中的 `Attempt`
+与本记录编号一致、当前租约仍未过期、且租约 token 与本尝试 `step_started` 时记录
+的 lease 一致。接管之后新尝试在跑时，旧尝试因编号和 token 都对不上而归入
+`interrupted`，不会再出现同一步骤两条「进行中」。
+
+**「剩余可用次数」（`RemainingBudget`）口径**：取该次 `step_started` 事件
+持久化的 `max_attempts`（即**当时**的有效预算 = 定义基准 `MaxAttempts` +
+截至当时历次续跑追加）减去本尝试编号，含义是「本次尝试开始后，之后还剩几次
+可用」。因此被中断且正好用光预算的那次为 0；`step_started` 缺少该明细的旧数据
+按「定义基准 + 续跑时间线」推算，定义未注册且无明细时为 -1（未知）。
+
+**相互印证**：每次尝试在 `step_started` 落盘时即计入预算消耗，被中断的那次也不
+例外——轨迹里它是 `interrupted` 且剩余次数相应扣减，实例终态的失败原因
+（`last attempt interrupted before completion`）与之一致，不会出现「既算用掉
+一次、又像没发生过」的矛盾；最终状态与轨迹末条记录一致。
 
 ---
 
@@ -261,6 +290,31 @@ go test ./... -race -count=20
 | `TestAuditTrailMatchesFinalState` | 审计轨迹与最终状态一致、重启后重建结果稳定 |
 | `TestAuditMarksInterruptedAttempt` | 崩溃中断的尝试被标记 interrupted 且计入预算 |
 | `TestAuditInProgressAttempt` | 在途尝试标记为 in_progress |
+| `TestAuditInterruptedLastBudgetExhausted` | 崩溃打断正好用光预算：末次判 `interrupted` 而非 `failed`，重启复盘一致 |
+| `TestAuditInterruptedButBudgetRemainsRetrySucceeds` | 崩溃打断但预算有余：旧尝试 `interrupted`，继续重试后成功，重启复盘一致 |
+| `TestAuditSingleInProgressAfterTakeover` | 接管后新尝试执行中：同一步骤只剩一条 `in_progress`，旧尝试按 `interrupted` 显示 |
+| `TestAuditStableAcrossRestartAtEveryStage` | 在途视角与终态视角下，换独立进程读盘复盘结论逐字段一致 |
+
+> 这四条用例的断言日志以 `scenario=interrupted-budget-exhausted`、
+> `scenario=interrupted-retry-succeeds`、`scenario=takeover-single-in-progress`、
+> `scenario=restart-consistency` 开头，逐条打印每次尝试的 `outcome/class/remaining`
+> 与 `stable_after_restart=true`，`go test -v` 可直接看出覆盖的业务场景与每条用例结论。
+
+### 如何在本地验证“被中断 / 只剩一条进行中 / 重启一致”
+
+```bash
+# 只跑复盘相关四条新场景（带业务日志）
+go test ./workflow/ -v -run 'TestAuditInterruptedLastBudgetExhausted|TestAuditInterruptedButBudgetRemainsRetrySucceeds|TestAuditSingleInProgressAfterTakeover|TestAuditStableAcrossRestartAtEveryStage'
+
+# 全量回归（确认原有审计/续跑/接管用例不回归）
+go test ./... -v
+go test ./... -race -count=20
+```
+
+崩溃/接管由测试确定性模拟：活动在 `step_started` 落盘后阻塞在 gate 上（代表进程
+被杀、协程被遗弃），随后关闭并以新 `FileStore` + 新 worker 重新打开目录、把假时钟
+推进过租约 TTL 触发接管；“重启后一致”由独立引擎只读同一目录做 `Audit` 并
+`reflect.DeepEqual` 比对验证。
 
 测试日志会打印工作流标识、步骤下标、状态变化、尝试序号、租约/fence 与失败分类，例如：
 
@@ -310,8 +364,12 @@ for { // 或用 eng.Run(ctx, interval)
   剩余预算按「定义基准 + 历次续跑追加」的时间线推算；定义未注册时该字段为 -1（未知），
   其余轨迹信息不受影响。
 - **行为变化点**：尝试开始前新增预算入账检查——崩溃留下的在途尝试若已耗尽预算，
-  接管时不再多跑一次活动，而是落账「预算耗尽（interrupted）」。这只影响
-  「崩溃恰好发生在最后一次预算尝试执行中」的实例，使其不再凭空多获一次活动调用。
+  接管时不再多跑一次活动，而是落账「预算耗尽（interrupted）」（`step_failed` 带
+  `interrupted=true`）。审计复盘据此把该次尝试显示为 `interrupted`（被中断、无业务
+  结果、`Class` 留空），与活动真实返回错误的 `failed` 区分；同一步骤在接管后新尝试
+  执行期间只保留一条 `in_progress`（编号与租约 token 必须同时对得上）。这只影响
+  「崩溃恰好发生在最后一次预算尝试执行中」等被中断场景的展示口径，不改变预算消耗与
+  实例成败结论。
 
 ## 设计边界与扩展点
 
