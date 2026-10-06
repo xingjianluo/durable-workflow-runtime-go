@@ -42,11 +42,17 @@ type AuditReport struct {
 
 // Audit 重建实例的完整尝试轨迹与续跑历史，用于解释“当时为什么继续、为什么终止”：
 //   - 每次 step_started 开一条尝试记录，step_succeeded/step_failed 将其闭环；
-//   - 没有闭环的尝试：若仍是当前在途尝试则为 in_progress，否则为 interrupted
-//     （崩溃或接管中断——该尝试已用掉一次预算，但不会重复产生副作用）；
+//   - step_failed 中 interrupted=true 的闭环（崩溃在途尝试接管时被补记预算耗尽）
+//     记为 interrupted，而不是 failed：被中断与业务真实返回错误必须可分开；
+//   - 没有闭环的尝试：只有“当前游标步骤、编号等于该步骤最新已开始尝试、
+//     且快照租约仍然活跃”的那一条是 in_progress；同一步骤其余历史在途尝试
+//     （接管前被打断的旧尝试）一律为 interrupted，同一时刻至多一条 in_progress；
 //   - 剩余预算优先取 step_started 事件中持久化的 max_attempts，缺失时按
 //     “定义基准 + 历次续跑追加”的时间线推算；
 //   - 续跑历史取自快照中持久化的 Resumes，与 workflow_resumed 事件一一对应。
+//
+// 全部输入来自持久化的快照与事件，因此进程重启后、或实例已到终态后再查，
+// 结论保持一致：in_progress 只能存在于“当前快照确实还有活跃租约”的时刻。
 func (e *Engine) Audit(ctx context.Context, id string) (*AuditReport, error) {
 	st, events, err := e.store.Load(ctx, id)
 	if err != nil {
@@ -97,12 +103,19 @@ func (e *Engine) Audit(ctx context.Context, id string) (*AuditReport, error) {
 				continue
 			}
 			rec := &rep.Attempts[idx]
-			end := ev.At
-			rec.EndedAt = &end
-			rec.Duration = end.Sub(rec.StartedAt)
 			if ev.Type == EvStepSucceeded {
+				end := ev.At
+				rec.EndedAt = &end
+				rec.Duration = end.Sub(rec.StartedAt)
 				rec.Outcome = OutcomeSucceeded
+			} else if detailBool(ev.Detail, "interrupted") {
+				// 接管时补记的“崩溃在途尝试预算耗尽”：该尝试从未跑出活动结果，
+				// 属于被中断，不能显示成业务失败。没有真实结束时刻，不写 EndedAt。
+				rec.Outcome = OutcomeInterrupted
 			} else {
+				end := ev.At
+				rec.EndedAt = &end
+				rec.Duration = end.Sub(rec.StartedAt)
 				rec.Outcome = OutcomeFailed
 				rec.Class = FailureClass(detailString(ev.Detail, "class"))
 			}
@@ -110,13 +123,17 @@ func (e *Engine) Audit(ctx context.Context, id string) (*AuditReport, error) {
 		}
 	}
 
-	// 未闭环的尝试：仍是当前在途尝试（步骤 running 且租约活跃）→ in_progress；
-	// 其余（崩溃/接管中断，或状态已前移）→ interrupted。
+	// 未闭环的尝试：只有“当前游标步骤、编号等于该步骤最新已开始尝试、
+	// 且快照中的租约仍然活跃”的那一条算 in_progress；接管发生后，旧尝试的
+	// 编号一定小于当前 Attempt，会落到 interrupted 分支——同一步骤同一时刻
+	// 至多一条 in_progress，旧尝试按真实结局（被中断）显示。
 	now := e.clock.Now()
 	for k, idx := range open {
 		rec := &rep.Attempts[idx]
-		if k.step == st.Cursor && k.step < len(st.Steps) &&
-			st.Steps[k.step].Status == StepRunning && leaseActive(st.Lease, now) {
+		inFlight := k.step == st.Cursor && k.step < len(st.Steps) &&
+			st.Steps[k.step].Status == StepRunning &&
+			k.attempt == st.Steps[k.step].Attempt && leaseActive(st.Lease, now)
+		if inFlight {
 			rec.Outcome = OutcomeInProgress
 		} else {
 			rec.Outcome = OutcomeInterrupted
@@ -164,4 +181,13 @@ func detailString(d map[string]any, k string) string {
 	}
 	s, _ := d[k].(string)
 	return s
+}
+
+// detailBool 读取事件 Detail 中的布尔值（JSON 反序列化后为 bool）。
+func detailBool(d map[string]any, k string) bool {
+	if d == nil {
+		return false
+	}
+	b, _ := d[k].(bool)
+	return b
 }

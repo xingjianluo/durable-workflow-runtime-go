@@ -291,6 +291,7 @@ func (e *Engine) commitBudgetExhausted(ctx context.Context, st *WorkflowState, s
 		step.Failures = append(step.Failures, Failure{
 			Attempt: step.Attempt, Class: FailureTransient,
 			Message: "attempt interrupted before completion (crash or takeover)", At: now, DuringLease: token,
+			Interrupted: true,
 		})
 	}
 
@@ -300,7 +301,7 @@ func (e *Engine) commitBudgetExhausted(ctx context.Context, st *WorkflowState, s
 	step.FinalClass = FailureTransient
 	step.FinalReason = reason
 	st.Status = WFFailed
-	st.Failure = &Failure{Attempt: step.Attempt, Class: FailureTransient, Message: reason, At: now, DuringLease: token}
+	st.Failure = &Failure{Attempt: step.Attempt, Class: FailureTransient, Message: reason, At: now, DuringLease: token, Interrupted: true}
 	st.Lease = nil
 	st.UpdatedAt = now
 	events := []Event{

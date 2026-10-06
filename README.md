@@ -181,6 +181,27 @@ IdempotencyToken = "<workflowID>#step<index>"
   `last attempt interrupted before completion`）——不会凭空多送一次活动调用；
 - 被中断的尝试可由 `Resume` 追加预算后继续，编号从 n+1 开始。
 
+**「被中断（interrupted）」与「业务失败（failed）」的判定口径**（运维必须能分开看）：
+
+| 复盘去向 | 判定条件（全部只依据已落盘的事件与快照） |
+| --- | --- |
+| `succeeded` | 该次 `step_started` 已被同编号 `step_succeeded` 闭环 |
+| `failed` | 该次 `step_started` 已被同编号 `step_failed` 闭环，且事件**没有** `interrupted=true` —— 活动真实返回了（瞬时/超时/永久）错误 |
+| `interrupted` | 满足二者之一：① 该次尝试只有 `step_started`、没有任何闭环事件（崩溃/接管打断，没跑出结果）；② 被同编号 `step_failed(interrupted=true)` 闭环，即接管时发现「最后一次预算的在途尝试已随崩溃消失」而补记的预算耗尽 |
+| `in_progress` | 未闭环，**并且**它就是当前快照游标步骤中编号最新（`Attempt` 相等）的那次尝试、步骤为 `running`、快照中的租约仍未过期。任一条件不满足都不是 in_progress |
+
+由此保证：
+
+- **同一步骤同一时刻至多一条 `in_progress`**：接管后新尝试编号更大，旧尝试编号
+  小于当前 `Attempt`，必然落为 `interrupted`，不会出现新旧两条都「进行中」；
+- **租约过期但尚无人接管**时也不显示 in_progress——此时已没有执行者在跑，
+  旧尝试按 `interrupted` 显示；而崩溃后立即重启、磁盘上旧租约仍在有效期内时，
+  复盘如实显示 in_progress（这正是崩溃瞬间的落盘状态，重启不改写）；
+- 终态实例里不存在 in_progress；被中断的尝试没有 `ended_at`（活动从未产出结果，
+  不存在真实结束时刻）。
+- 除审计去向之外，步骤失败历史与工作流终态失败中的对应记录带有显式
+  `Failure.Interrupted=true` 标志，程序里不必靠消息字符串区分。
+
 ### 3.6 审计轨迹（Audit）
 
 `Engine.Audit(id)` 从**持久化的事件与快照**重建完整复盘报告（不依赖进程内存，
@@ -188,8 +209,20 @@ IdempotencyToken = "<workflowID>#step<index>"
 
 - `Attempts`：每一次尝试的步骤、编号、开始/结束时间与时长、去向分类
   （`succeeded` / `failed` / `interrupted` / `in_progress`）、失败分类、
-  租约标识，以及**该次尝试开始时按当时预算计算的剩余可用次数**；
+  租约标识，以及**该次尝试开始时按当时预算计算的剩余可用次数**。
+  剩余可用次数口径：`RemainingBudget = 当时的有效预算 − 本次尝试编号`，
+  即「本次尝试已经入账之后、还允许再发起多少次尝试」；因此第一次尝试后为
+  `MaxAttempts−1`，最后一次预算的尝试为 0，被中断的尝试同样消耗预算、
+  剩余次数照算（不会因为没跑出结果就把预算退回去）。有效预算取该次
+  `step_started` 事件里持久化的 `max_attempts`（= 定义基准 + 当时已追加预算）；
+  旧事件缺少该明细时，按「定义基准 + 历次 `workflow_resumed` 追加」的时间线推算；
+  定义未注册且无法推算时为 -1（未知）。
 - `Resumes`：实例被续跑过几次、每次给哪一步追加了多少预算、何时由谁发起。
+
+**可相互印证、不自相矛盾**：每条 `interrupted` 都对应一次已落盘的
+`step_started`（预算确实用掉），且没有任何活动结果事件（确实没跑出结果）；
+预算随 `workflow_resumed` 追加、随 `step_started` 单调消耗；
+最终状态（`completed`/`failed`）与轨迹末条记录及快照 `Failure` 一一对应。
 
 把 `Attempts` 与 `Resumes` 串起来即可解释「当时为什么继续、为什么终止」：
 预算随续跑事件追加、随 `step_started` 消耗，最终状态与轨迹末条记录一致。
@@ -261,6 +294,10 @@ go test ./... -race -count=20
 | `TestAuditTrailMatchesFinalState` | 审计轨迹与最终状态一致、重启后重建结果稳定 |
 | `TestAuditMarksInterruptedAttempt` | 崩溃中断的尝试被标记 interrupted 且计入预算 |
 | `TestAuditInProgressAttempt` | 在途尝试标记为 in_progress |
+| `TestAuditCrashOnLastAttemptMarkedInterrupted` | **崩溃打断正好用完预算**：实例判失败，复盘把该尝试标 interrupted 而非 failed；失败记录带 `interrupted` 标志；重启后一致 |
+| `TestAuditCrashWithBudgetLeftRetriesAndInterruptedIsSeparated` | **崩溃打断但预算有剩余**：接管方连续编号重试，旧尝试 interrupted（无失败记录）、新尝试按真实业务结果显示，剩余预算逐次递减 |
+| `TestAuditTakeoverLeavesOnlyOneInProgress` | **接管后新尝试执行中**：同一步骤只有一条 in_progress（最新编号+活跃租约），历史被打断尝试全部 interrupted |
+| `TestAuditStableAcrossRestartsAtEveryStage` | **重启一致性**：在途、崩溃后立即重启（旧租约未过期）、旧租约过期未接管、接管终态四个阶段反复重开目录，复盘结论稳定且不自相矛盾 |
 
 测试日志会打印工作流标识、步骤下标、状态变化、尝试序号、租约/fence 与失败分类，例如：
 
@@ -269,6 +306,25 @@ level=info workflow=wf-1 step=0 msg="step started" status=running attempt=1 acti
 level=warn workflow=wf-r step=0 msg="step failed" status=waiting attempt=1 class=transient will_retry=true backoff=50ms
 level=error workflow=wf-p step=0 msg="step failed" status=failed attempt=1 class=permanent will_retry=false
 ```
+
+只跑“崩溃/接管复盘”相关用例并查看每个业务场景的结论日志：
+
+```bash
+go test ./workflow/ -v -run 'TestAudit'
+# 日志中每个用例末尾有一行 scenario=... result=...，例如：
+# scenario=crash-exhausts-budget result=attempt1=interrupted remaining=0 workflow=failed final_reason="retry budget exhausted ... last attempt interrupted before completion" stable_after_restart=true
+# scenario=crash-budget-left-continues result=attempts=[interrupted(rem=2) failed(rem=1) succeeded(rem=0)] stable_after_restart=true
+# scenario=takeover-single-in-progress result=live_audit=[interrupted,interrupted,failed(in_progress=1)] final=[interrupted,interrupted,failed,succeeded]
+# scenario=audit-stable-across-restarts result=stages=[live:in_progress after-crash:in_progress lease-expired:interrupted terminal:interrupted]
+```
+
+手工核对口径时可关注三点：
+
+1. `interrupted` 的尝试**没有** `ended_at`，且对应步骤失败记录里 `interrupted=true`；
+   业务真实失败的记录该标志为 false、有正常结束时间——两类不要混看；
+2. 同一 `step_index` 的全部尝试记录里 `outcome=in_progress` 至多一条；
+3. 每条尝试的 `remaining_budget` 与事件时间线吻合（续跑追加会让后续尝试的剩余变多），
+   且最终 `status` 与最后一条尝试的去向一致。
 
 ### 端到端示例
 
@@ -302,8 +358,9 @@ for { // 或用 eng.Run(ctx, interval)
 ## 兼容性（老实例与已有数据）
 
 - **旧数据可直接打开**：`StepState.ExtraAttempts`、`WorkflowState.Resumes`、
-  `workflow_resumed` 事件均为新增可选字段，旧实例文件缺省为零值，语义与升级前完全一致
-  （有效预算 = 定义中的 `MaxAttempts`）。
+  `workflow_resumed` 事件、`Failure.Interrupted` 均为新增可选字段，旧实例文件
+  缺省为零值，语义与升级前完全一致（有效预算 = 定义中的 `MaxAttempts`；
+  历史失败记录默认按“业务真实失败”理解）。
 - **旧失败实例可续跑**：升级前进入 `failed` 的实例同样可 `Resume`，
   尝试编号从既有 `Attempt` 继续。
 - **审计对旧事件降级可用**：旧 `step_started` 事件缺少 `max_attempts` 明细时，

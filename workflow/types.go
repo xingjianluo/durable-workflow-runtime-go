@@ -47,6 +47,10 @@ type Failure struct {
 	At          time.Time    `json:"at"`
 	DuringLease string       `json:"lease_id,omitempty"`
 	TimedOut    bool         `json:"timed_out,omitempty"`
+	// Interrupted 表示这次“失败”并非活动返回的业务错误，而是尝试在活动执行期间
+	// 被进程崩溃/接管打断、从未提交结果，接管时按预算规则补记入账。
+	// 运维复盘必须能把它与业务真实错误分开；旧数据缺省为 false，语义不变。
+	Interrupted bool `json:"interrupted,omitempty"`
 }
 
 // EventType 是事件日志中记录的状态变化种类。
